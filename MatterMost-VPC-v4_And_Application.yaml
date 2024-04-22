@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create VPC and Networking Resources
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      [t2.micro, t2.small, t2.medium, m3.medium, m4.large, m4.xlarge]
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id"
+  
+  VpcCIDR:
+    Description: CIDR Range for the VPC
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 10.1.0.0/16
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+Resources:
+  # First, a VPC:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value:  !Join ['', [!Ref "AWS::StackName", "-VPC" ]]
+           #Value: !Sub "${AWS::StackName}-VPC"
+          #Value: mmdemo-vpc2
+  # VPC will need internet access:
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+
+  # Attach the IGW to the VPC:
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create public subnets A
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ] # Get the first AZ in the list
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Public-A
+ # Create public subnets B        
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.20.0/24
+      AvailabilityZone: !Select [1, !GetAZs ] # Get the second AZ in the list
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Public-B
+
+  # Create private subnets A & B
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.50.0/24
+      AvailabilityZone: !Select [0, !GetAZs ] # Get the first AZ in the list
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Private-A
+  # Create private subnets B        
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.60.0/24
+      AvailabilityZone: !Select [1, !GetAZs ] # Get the second AZ in the list
+      Tags:
+        - Key: Name
+          Value:
+            !Sub ${AWS::StackName}-Private-B
+            # Some route tables for our subnets:
+
+  # Here is a public route table:
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public
+
+  PublicRoute1: # Public route table has direct routing to IGW:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Here is a private route table:
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIPAddress.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub NAT-${AWS::StackName}
+
+    # Create an Elastic IP for the NAT Gateway:
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: VPC
+
+  PrivateRoute1: # Private route table can access web via NAT (created below)
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      # Route traffic through the NAT Gateway:
+      NatGatewayId: !Ref NATGateway
+      # Attach the public subnets to public route tables,
+  # and attach the private subnets to private route tables:
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  MattermostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and HTTP access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8065
+          ToPort: 8065
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: MattermostSecurityGroup
+          
+  MattermostInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      #ImageId: ami-080e1f13689e07408 #change: Replace with your desired Ubuntu AMI ID
+      ImageId: !Ref LatestAmiId
+      #KeyName: matter-most #change: Replace with your EC2 key pair name
+      SecurityGroups:
+        - !Ref MattermostSecurityGroup
+      # Assign the instance to the private subnet
+      # SubnetId: !Ref PrivateSubnetA
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update package index
+          apt-get update -y
+
+          # Install packages to allow apt to use a repository over HTTPS
+          apt-get install -y \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gnupg \
+              lsb-release
+
+          # Add Docker's official GPG key
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+          # Set up the stable repository
+          echo \
+              "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+          # Install Docker Engine
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+
+          # Install Docker Compose
+          curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          # Clone the Mattermost Docker repository
+          git clone https://github.com/mattermost/docker
+          cd docker
+
+          # Create .env file
+          cp env.example .env
+
+          # Create required directories and set permissions
+          mkdir -p ./volumes/app/mattermost/{config,data,logs,plugins,client/plugins,bleve-indexes}
+          chown -R 2000:2000 ./volumes/app/mattermost
+
+          # Deploy Mattermost without NGINX
+          sudo docker-compose -f docker-compose.yml -f docker-compose.without-nginx.yml up -d
