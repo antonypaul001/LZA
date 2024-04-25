@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: > 
+  Create a VPC with public and private subnets, launch an EC2 Ubuntu linux instance and
+  Deploy Mattermost Application on docker as per the duidelines mentioned in the url https://docs.mattermost.com/install/install-docker.html, set up a Network Load Balancer, and
+  Create an Endpoint Service.
+  Output the NLB url and the Endpoint Service name.
+  This template can be run in any region. The latest ubuntu AMI is used for the EC2 instance.
+  Some of the resource names are suffixed with the stack name to ensure uniqueness.
+  The default MatterMost port is 8065. The template can be modified to use a different port.
+  Suggested stack name: Mattermost-Provider
+  Initial Version :  Antony Karikkassery
+  Initial Release Date : 2024-04-24
+
+Parameters:
+  VpcCIDR:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.1.0.0/24
+  PublicSubnetCIDR:
+    Description: CIDR block for the public subnet
+    Type: String
+    Default: 10.1.0.0/28
+  PrivateSubnetCIDR:
+    Description: CIDR block for the private subnet
+    Type: String
+    Default: 10.1.0.16/28
+  EC2InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+  AMIId:
+    Description: ID of the AMI to use for the EC2 instance
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-eip
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCIDR
+      # AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCIDR
+      # AvailabilityZone: us-east-1a
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-subnet
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIPAddress.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat          
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-rtb
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-rtb
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+  NLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Network Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8065
+          ToPort: 8065
+          CidrIp: !Ref VpcCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nlb-sg
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AWS::StackName}-nlb
+      Subnets:
+        - !Ref PrivateSubnet
+      Scheme: internal
+      Type: network
+      SecurityGroups:
+        - !GetAtt NLBSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nlb
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: MattermostTargetGroup
+      Port: 8065
+      Protocol: TCP
+      Targets:
+        - Id: !GetAtt EC2Instance.InstanceId
+          Port: 8065
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nlb-tg
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref NLB
+      Port: 8065
+      Protocol: TCP
+  SSMIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  MMIAMInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref SSMIAMRole      
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      ImageId: !Ref AMIId
+      SubnetId: !Ref PrivateSubnet
+      IamInstanceProfile: !Ref MMIAMInstanceProfile      
+      SecurityGroupIds:
+        - !GetAtt EC2SecurityGroup.GroupId
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Update package index
+          apt-get update -y
+
+          # Install packages to allow apt to use a repository over HTTPS
+          apt-get install -y \
+              apt-transport-https \
+              ca-certificates \
+              curl \
+              gnupg \
+              lsb-release
+
+          # Add Docker's official GPG key
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+          # Set up the stable repository
+          echo \
+              "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+          # Install Docker Engine
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+
+          # Install Docker Compose
+          curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          # Clone the Mattermost Docker repository
+          git clone https://github.com/mattermost/docker
+          cd docker
+
+          # Create .env file
+          cp env.example .env
+          #sed -i 's/APP_PORT=8065/APP_PORT=8066/g' .env
+          # Create required directories and set permissions
+          mkdir -p ./volumes/app/mattermost/{config,data,logs,plugins,client/plugins,bleve-indexes}
+          chown -R 2000:2000 ./volumes/app/mattermost
+
+          # Deploy Mattermost without NGINX
+          sudo docker-compose -f docker-compose.yml -f docker-compose.without-nginx.yml up -d
+          #  Additional deployments not part MatterMost
+          # Install Apache web server
+            apt-get install apache2 -y
+          # Install PHP
+            apt-get install php libapache2-mod-php -y
+          # Restart Apache to apply changes
+            systemctl restart apache2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-server
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8065
+          ToPort: 8065
+          SourceSecurityGroupId: !GetAtt NLBSecurityGroup.GroupId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-sg
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      NetworkLoadBalancerArns:
+        - !Ref NLB
+      AcceptanceRequired: true
+      GatewayLoadBalancerArns: []
+Outputs:
+  NLBDNS:
+    Value: !GetAtt NLB.DNSName
+  EndpointServiceName:
+    #Value: !GetAtt EndpointService.ServiceId
+    Value: !Sub com.amazonaws.vpce.${AWS::Region}.${EndpointService}
